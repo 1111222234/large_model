@@ -1,0 +1,428 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import build_vocab_from_iterator
+from torch.nn.utils.rnn import pad_sequence
+from torch.nn import functional as F
+from datasets import load_dataset
+
+import math
+import time
+import copy
+import matplotlib.pyplot as plt
+
+# ---------------------------------------------------------------------------- #
+# 0. 超参数与设备设置 (保持不变)
+# ---------------------------------------------------------------------------- #
+class Config:
+    SRC_LANGUAGE = 'en'
+    TGT_LANGUAGE = 'de'
+    MODEL_PATH = 'transformer_manual_optimized.pt' # 新模型名
+    BATCH_SIZE = 32
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    D_MODEL = 512
+    N_HEAD = 8
+    N_ENCODER_LAYERS = 6
+    N_DECODER_LAYERS = 6
+    D_HID = 2048
+    
+    DROPOUT = 0.1
+    EPOCHS = 8
+    LR = 5e-4
+    GRAD_CLIP = 1.0
+    LABEL_SMOOTHING = 0.1
+
+config = Config()
+print(f"Using device: {config.DEVICE}")
+
+# ---------------------------------------------------------------------------- #
+# 1. 数据加载与预处理 (保持不变)
+# ---------------------------------------------------------------------------- #
+print("\nLoading tokenizers and data...")
+token_transform = { config.SRC_LANGUAGE: get_tokenizer('basic_english'), config.TGT_LANGUAGE: get_tokenizer('basic_english') }
+UNK_IDX, PAD_IDX, BOS_IDX, EOS_IDX = 0, 1, 2, 3
+special_symbols = ['<unk>', '<pad>', '<bos>', '<eos>']
+print("Loading dataset using FULLY LOCAL script and data...")
+hf_dataset = load_dataset("./iwslt2017.py", "iwslt2017-en-de")
+print("Dataset loaded successfully."), print(hf_dataset)
+def yield_tokens(data_iter, language):
+    for item in data_iter: yield token_transform[language](item['translation'][language])
+vocab_transform = {}
+for ln in [config.SRC_LANGUAGE, config.TGT_LANGUAGE]:
+    vocab_transform[ln] = build_vocab_from_iterator(
+        yield_tokens(hf_dataset['train'], ln), min_freq=1, specials=special_symbols, special_first=True
+    )
+    vocab_transform[ln].set_default_index(UNK_IDX)
+SRC_VOCAB_SIZE, TGT_VOCAB_SIZE = len(vocab_transform[config.SRC_LANGUAGE]), len(vocab_transform[config.TGT_LANGUAGE])
+print(f"Source vocab size: {SRC_VOCAB_SIZE}, Target vocab size: {TGT_VOCAB_SIZE}")
+class HFTextDataset(Dataset):
+    def __init__(self, hf_split, src_lang, tgt_lang): self.hf_split, self.src_lang, self.tgt_lang = hf_split, src_lang, tgt_lang
+    def __len__(self): return len(self.hf_split)
+    def __getitem__(self, idx):
+        item = self.hf_split[idx]['translation']
+        src_text, tgt_text = item[self.src_lang], item[self.tgt_lang]
+        src_tensor = torch.tensor([BOS_IDX] + vocab_transform[self.src_lang](token_transform[self.src_lang](src_text)) + [EOS_IDX], dtype=torch.long)
+        tgt_tensor = torch.tensor([BOS_IDX] + vocab_transform[self.tgt_lang](token_transform[self.tgt_lang](tgt_text)) + [EOS_IDX], dtype=torch.long)
+        return src_tensor, tgt_tensor
+def collate_fn_from_dataset(batch):
+    src_batch, tgt_batch = [], []
+    for src_tensor, tgt_tensor in batch: src_batch.append(src_tensor), tgt_batch.append(tgt_tensor)
+    src_padded = pad_sequence(src_batch, padding_value=PAD_IDX)
+    tgt_padded = pad_sequence(tgt_batch, padding_value=PAD_IDX)
+    return src_padded.to(config.DEVICE), tgt_padded.to(config.DEVICE)
+train_dataset, valid_dataset, test_dataset = HFTextDataset(hf_dataset['train'], config.SRC_LANGUAGE, config.TGT_LANGUAGE), HFTextDataset(hf_dataset['validation'], config.SRC_LANGUAGE, config.TGT_LANGUAGE), HFTextDataset(hf_dataset['test'], config.SRC_LANGUAGE, config.TGT_LANGUAGE)
+train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, collate_fn=collate_fn_from_dataset, shuffle=True)
+valid_dataloader = DataLoader(valid_dataset, batch_size=config.BATCH_SIZE, collate_fn=collate_fn_from_dataset)
+test_dataloader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, collate_fn=collate_fn_from_dataset)
+print("Data processing complete.")
+
+# ###################################################################### #
+# # --- [核心重构] 手动实现 Transformer 组件 --- #
+# ###################################################################### #
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_head, dropout):
+        super().__init__()
+        assert d_model % n_head == 0, "d_model must be divisible by n_head"
+        self.d_model = d_model
+        self.n_head = n_head
+        self.head_dim = d_model // n_head
+        
+        self.fc_q = nn.Linear(d_model, d_model)
+        self.fc_k = nn.Linear(d_model, d_model)
+        self.fc_v = nn.Linear(d_model, d_model)
+        self.fc_o = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = torch.sqrt(torch.FloatTensor([self.head_dim])).to(config.DEVICE)
+
+    def forward(self, query, key, value, mask=None):
+        # query, key, value: [seq_len, batch_size, d_model]
+        batch_size = query.shape[1]
+
+        Q = self.fc_q(query)
+        K = self.fc_k(key)
+        V = self.fc_v(value)
+        
+        # Reshape for multi-head attention
+        # Q: [seq_len, batch_size, n_head, head_dim] -> [batch_size, n_head, seq_len, head_dim]
+        Q = Q.view(-1, batch_size, self.n_head, self.head_dim).permute(1, 2, 0, 3)
+        K = K.view(-1, batch_size, self.n_head, self.head_dim).permute(1, 2, 0, 3)
+        V = V.view(-1, batch_size, self.n_head, self.head_dim).permute(1, 2, 0, 3)
+        
+        # Scaled Dot-Product Attention
+        energy = torch.matmul(Q, K.permute(0, 1, 3, 2)) / self.scale
+        
+        if mask is not None:
+            energy = energy.masked_fill(mask == 1, -1e10) # PyTorch native mask is bool, we adapt here
+            
+        attention = torch.softmax(energy, dim=-1)
+        attention = self.dropout(attention)
+        
+        # x: [batch_size, n_head, seq_len, head_dim]
+        x = torch.matmul(attention, V)
+        
+        # Concatenate heads and pass through final linear layer
+        # x: [batch_size, n_head, seq_len, head_dim] -> [seq_len, batch_size, d_model]
+        x = x.permute(2, 0, 1, 3).contiguous()
+        x = x.view(-1, batch_size, self.d_model)
+        
+        return self.fc_o(x)
+
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, d_model, d_hid, dropout):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_hid)
+        self.fc2 = nn.Linear(d_hid, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: [seq_len, batch_size, d_model]
+        x = self.dropout(torch.relu(self.fc1(x)))
+        return self.fc2(x)
+
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, n_head, d_hid, dropout):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, n_head, dropout)
+        self.ffn = PositionwiseFeedForward(d_model, d_hid, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src, src_mask):
+        # Self-attention
+        _src = self.self_attn(query=src, key=src, value=src, mask=src_mask)
+        src = self.norm1(src + self.dropout(_src))
+        
+        # Feed-forward
+        _src = self.ffn(src)
+        src = self.norm2(src + self.dropout(_src))
+        return src
+
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, n_head, d_hid, dropout):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, n_head, dropout)
+        self.cross_attn = MultiHeadAttention(d_model, n_head, dropout)
+        self.ffn = PositionwiseFeedForward(d_model, d_hid, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, tgt, memory, tgt_mask, memory_mask):
+        # Masked Self-attention
+        _tgt = self.self_attn(query=tgt, key=tgt, value=tgt, mask=tgt_mask)
+        tgt = self.norm1(tgt + self.dropout(_tgt))
+        
+        # Cross-attention with encoder output (memory)
+        _tgt = self.cross_attn(query=tgt, key=memory, value=memory, mask=memory_mask)
+        tgt = self.norm2(tgt + self.dropout(_tgt))
+        
+        # Feed-forward
+        _tgt = self.ffn(tgt)
+        tgt = self.norm3(tgt + self.dropout(_tgt))
+        return tgt
+
+class Encoder(nn.Module):
+    def __init__(self, d_model, n_head, d_hid, n_layers, dropout):
+        super().__init__()
+        self.layers = nn.ModuleList([EncoderLayer(d_model, n_head, d_hid, dropout) for _ in range(n_layers)])
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, src, src_mask):
+        for layer in self.layers:
+            src = layer(src, src_mask)
+        return self.norm(src)
+
+class Decoder(nn.Module):
+    def __init__(self, d_model, n_head, d_hid, n_layers, dropout):
+        super().__init__()
+        self.layers = nn.ModuleList([DecoderLayer(d_model, n_head, d_hid, dropout) for _ in range(n_layers)])
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, tgt, memory, tgt_mask, memory_mask):
+        for layer in self.layers:
+            tgt = layer(tgt, memory, tgt_mask, memory_mask)
+        return self.norm(tgt)
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2], pe[:, 0, 1::2] = torch.sin(position * div_term), torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+    def forward(self, x):
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+
+class TokenEmbedding(nn.Module):
+    def __init__(self, vocab_size, d_model):
+        super(TokenEmbedding, self).__init__()
+        self.embedding, self.d_model = nn.Embedding(vocab_size, d_model), d_model
+    def forward(self, tokens): return self.embedding(tokens.long()) * math.sqrt(self.d_model)
+
+class ManualTransformer(nn.Module):
+    def __init__(self, num_encoder_layers, num_decoder_layers, d_model, nhead,
+                 src_vocab_size, tgt_vocab_size, dim_feedforward, dropout):
+        super().__init__()
+        
+        self.src_tok_emb = TokenEmbedding(src_vocab_size, d_model)
+        self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, d_model)
+        self.positional_encoding = PositionalEncoding(d_model, dropout)
+        
+        self.encoder = Encoder(d_model, nhead, dim_feedforward, num_encoder_layers, dropout)
+        self.decoder = Decoder(d_model, nhead, dim_feedforward, num_decoder_layers, dropout)
+        
+        self.generator = nn.Linear(d_model, tgt_vocab_size)
+        self.tgt_tok_emb.embedding.weight = self.generator.weight
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1: nn.init.xavier_uniform_(p)
+
+    def forward(self, src, tgt, src_padding_mask, tgt_padding_mask, memory_key_padding_mask, tgt_mask):
+        src_emb = self.positional_encoding(self.src_tok_emb(src))
+        tgt_emb = self.positional_encoding(self.tgt_tok_emb(tgt))
+        
+        # nn.Transformer's padding mask is True for padded positions.
+        # Our collate_fn produces False for padded positions. So, we need to adapt the mask format.
+        # However, our MultiHeadAttention already handles this with `masked_fill(mask == 1, -1e10)`.
+        # The `create_mask` function creates a boolean mask where True means "to be masked".
+        # We need to reshape the padding masks to be broadcastable for multi-head attention.
+        # [batch_size, seq_len] -> [batch_size, 1, 1, seq_len] for K
+        src_padding_mask_for_attn = src_padding_mask.unsqueeze(1).unsqueeze(2)
+        tgt_padding_mask_for_attn = tgt_padding_mask.unsqueeze(1).unsqueeze(2)
+
+        memory = self.encoder(src_emb, src_padding_mask_for_attn)
+        output = self.decoder(tgt_emb, memory, tgt_mask, src_padding_mask_for_attn) # Use src padding for memory mask
+        return self.generator(output)
+
+    def encode(self, src, src_mask):
+        # During inference, src_mask might be different. Let's make it compatible.
+        src_emb = self.positional_encoding(self.src_tok_emb(src))
+        return self.encoder(src_emb, src_mask)
+
+    def decode(self, tgt, memory, tgt_mask):
+        # During inference, there is no padding mask for tgt or memory.
+        tgt_emb = self.positional_encoding(self.tgt_tok_emb(tgt))
+        return self.decoder(tgt_emb, memory, tgt_mask, None)
+
+# ###################################################################### #
+
+def generate_square_subsequent_mask(sz): return torch.triu(torch.ones(sz, sz, device=config.DEVICE), diagonal=1).bool()
+def create_mask(src, tgt):
+    tgt_len = tgt.shape[0]
+    tgt_mask = generate_square_subsequent_mask(tgt_len)
+    
+    # Padding masks: True where the value is PAD_IDX
+    src_padding_mask = (src == PAD_IDX).transpose(0, 1)
+    tgt_padding_mask = (tgt == PAD_IDX).transpose(0, 1)
+    
+    return src_padding_mask, tgt_padding_mask, tgt_mask
+
+# ---------------------------------------------------------------------------- #
+# 3. 实例化模型和训练设置 (使用新的 ManualTransformer)
+# ---------------------------------------------------------------------------- #
+model = ManualTransformer( # <-- [核心重构] 使用手动实现的模型类
+    config.N_ENCODER_LAYERS, config.N_DECODER_LAYERS, config.D_MODEL,
+    config.N_HEAD, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE, config.D_HID, config.DROPOUT
+).to(config.DEVICE)
+
+criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX, label_smoothing=config.LABEL_SMOOTHING)
+optimizer = torch.optim.AdamW(model.parameters(), lr=config.LR, betas=(0.9, 0.98), eps=1e-9)
+total_steps = len(train_dataloader) * config.EPOCHS
+scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=config.LR, total_steps=total_steps)
+
+# ---------------------------------------------------------------------------- #
+# 4. 训练和评估循环 (保持不变)
+# ---------------------------------------------------------------------------- #
+def train_epoch(model, optimizer, dataloader, epoch, scheduler):
+    model.train()
+    total_loss, log_interval = 0, 200
+    start_time = time.time()
+    num_batches = len(dataloader)
+    last_interval_loss = 0
+    for batch_idx, (src, tgt) in enumerate(dataloader):
+        tgt_input, tgt_out = tgt[:-1, :], tgt[1:, :]
+        src_padding_mask, tgt_padding_mask, tgt_mask = create_mask(src, tgt_input)
+        
+        # 注意: 手动实现的 forward 签名与 nn.Transformer 不同，我们在这里适配
+        # nn.Transformer takes memory_key_padding_mask separately.
+        # Our implementation logically uses src_padding_mask for memory's key padding.
+        logits = model(src, tgt_input, src_padding_mask, tgt_padding_mask, src_padding_mask, tgt_mask)
+        
+        optimizer.zero_grad()
+        loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1))
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
+        optimizer.step()
+        scheduler.step()
+        total_loss += loss.item()
+        if batch_idx > 0 and batch_idx % log_interval == 0:
+            elapsed = time.time() - start_time
+            avg_loss_interval = total_loss / log_interval
+            last_interval_loss = avg_loss_interval
+            print(f"| Epoch {epoch:02d} | Batch {batch_idx:5d}/{num_batches:5d} "
+                  f"| lr {scheduler.get_last_lr()[0]:.2e} | ms/batch {elapsed * 1000 / log_interval:5.2f} "
+                  f"| Loss {avg_loss_interval:.3f} | Perplexity {math.exp(avg_loss_interval):8.2f}")
+            total_loss, start_time = 0, time.time()
+    return last_interval_loss if last_interval_loss > 0 else (total_loss / (len(dataloader) % log_interval or 1))
+
+def evaluate(model, dataloader):
+    model.eval()
+    losses = 0
+    with torch.no_grad():
+        for src, tgt in dataloader:
+            tgt_input, tgt_out = tgt[:-1, :], tgt[1:, :]
+            src_padding_mask, tgt_padding_mask, tgt_mask = create_mask(src, tgt_input)
+            logits = model(src, tgt_input, src_padding_mask, tgt_padding_mask, src_padding_mask, tgt_mask)
+            loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1))
+            losses += loss.item()
+    return losses / len(dataloader)
+
+# ---------------------------------------------------------------------------- #
+# 5. 主训练循环 (保持不变)
+# ---------------------------------------------------------------------------- #
+print("\nStarting training with MANUALLY IMPLEMENTED Transformer...")
+best_val_loss = float('inf')
+history = {'train_loss': [], 'val_loss': []}
+for epoch in range(1, config.EPOCHS + 1):
+    epoch_start_time = time.time()
+    train_loss_representative = train_epoch(model, optimizer, train_dataloader, epoch, scheduler)
+    val_loss = evaluate(model, valid_dataloader)
+    history['train_loss'].append(train_loss_representative)
+    history['val_loss'].append(val_loss)
+    print("-" * 89)
+    print(f"| end of epoch {epoch:02d} | time: {(time.time() - epoch_start_time):.3f}s "
+          f"| valid loss {val_loss:.3f} | valid perplexity {math.exp(val_loss):8.2f}")
+    print("-" * 89)
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), config.MODEL_PATH)
+        print(f"Model saved to {config.MODEL_PATH}")
+
+# ---------------------------------------------------------------------------- #
+# 6. 最终评估与推理 (适配新的 encode/decode)
+# ---------------------------------------------------------------------------- #
+print("\n--- Final Evaluation and Inference ---")
+model.load_state_dict(torch.load(config.MODEL_PATH))
+test_loss = evaluate(model, test_dataloader)
+print(f"Test Loss: {test_loss:.3f} | Test Perplexity: {math.exp(test_loss):.3f}")
+
+def greedy_decode(model, src, max_len, start_symbol):
+    src = src.to(config.DEVICE)
+    # 在推理时，通常没有源填充，所以mask可以为None。如果源有填充，则需要创建mask。
+    src_mask = None # For simplicity, assuming no padding in single-sentence inference
+    memory = model.encode(src, src_mask) 
+    memory = memory.to(config.DEVICE)
+    ys = torch.ones(1, 1).fill_(start_symbol).type(torch.long).to(config.DEVICE)
+    for _ in range(max_len - 1):
+        tgt_mask = generate_square_subsequent_mask(ys.size(0)).to(ys.device)
+        out = model.decode(ys, memory, tgt_mask)
+        out = out.transpose(0, 1)
+        prob = model.generator(out[:, -1])
+        _, next_word = torch.max(prob, dim=1)
+        next_word = next_word.item()
+        ys = torch.cat([ys, torch.ones(1, 1, device=config.DEVICE).fill_(next_word)], dim=0)
+        if next_word == EOS_IDX: break
+    return ys
+
+def translate(model, src_sentence):
+    model.eval()
+    src_tokens = [BOS_IDX] + vocab_transform[config.SRC_LANGUAGE](token_transform[config.SRC_LANGUAGE](src_sentence)) + [EOS_IDX]
+    src = torch.tensor(src_tokens, dtype=torch.long).view(-1, 1)
+    tgt_tokens = greedy_decode(model, src, max_len=src.shape[0] + 15, start_symbol=BOS_IDX).flatten()
+    return " ".join(vocab_transform[config.TGT_LANGUAGE].lookup_tokens(list(tgt_tokens.cpu().numpy()))).replace("<bos>", "").replace("<eos>", "")
+
+print("\nTranslating an example sentence...")
+src_sentence = "a man in a blue shirt is running on the beach"
+translated_sentence = translate(model, src_sentence)
+print(f"Source:     {src_sentence}")
+print(f"Translated: {translated_sentence}")
+
+# ---------------------------------------------------------------------------- #
+# 7. 绘制并保存损失曲线 (保持不变)
+# ---------------------------------------------------------------------------- #
+print("\nPlotting and saving the training and validation loss curve...")
+plt.figure(figsize=(10, 6))
+plt.plot(history['train_loss'], label='Training Loss (representative)', marker='o')
+plt.plot(history['val_loss'], label='Validation Loss', marker='x')
+plt.title('Training & Validation Loss Over Epochs')
+plt.xlabel('Epoch'), plt.ylabel('Loss')
+plt.xticks(ticks=range(len(history['train_loss'])), labels=range(1, config.EPOCHS + 1))
+plt.legend(), plt.grid(True)
+save_path = 'training_validation_loss_manual_optimized.png'
+plt.savefig(save_path)
+print(f"Loss curve image saved to {save_path}")
+try: plt.show()
+except Exception as e: print(f"Could not display plot. This is normal in a non-GUI environment. Error: {e}")
+
+print("\nScript finished.")
